@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-축제가 온라인 관심도(SNS 검색량)에 미치는 영향 분석 대시보드
-- 데이터: SQLite (festival, sns_mention)
-- 분석단위: 축제 회차(edition) / 유의성 검정은 축제 단위(n=44)
+축제가 온라인 관심도(SNS 검색량)에 미치는 영향 — 계절성 보정(이중차분) 분석 대시보드
+
+핵심 개선:
+  기존 "축제月 vs ±3개월" 비교는 축제효과와 계절수요가 섞임.
+  → 코로나로 축제가 열리지 않은 2020·2021년의 '같은 달'을 반사실(counterfactual)로 사용.
+    같은 ±3개월 윈도우·같은 지표를 적용해 계절성을 상쇄(difference-in-differences).
+  유지 조건: ±3개월 윈도우, 2020년 이후 개최 축제 전체.
+
 실행: streamlit run app.py
 """
 import sqlite3
@@ -13,298 +18,369 @@ import plotly.express as px
 import plotly.graph_objects as go
 from scipy import stats
 
-st.set_page_config(page_title="축제 온라인 관심도 영향 분석", layout="wide")
+st.set_page_config(page_title="축제 온라인 관심도 영향 (계절보정)", layout="wide")
 
 PERIOD_ORDER = ["BEFORE_3M", "BEFORE_2M", "BEFORE_1M", "FESTIVAL",
                 "AFTER_1M", "AFTER_2M", "AFTER_3M"]
 OFFSET_LABEL = {-3: "BEFORE_3M", -2: "BEFORE_2M", -1: "BEFORE_1M", 0: "FESTIVAL",
                 1: "AFTER_1M", 2: "AFTER_2M", 3: "AFTER_3M"}
+PLACEBO_YEARS = (2020, 2021)   # 코로나로 축제 미개최 → 자연 대조군
 
-# ---------------------------------------------------------------------------
-# 분석의 핵심 SQL: 선별 축제의 개최월(FESTIVAL)을 기준(M)으로 ±3개월 SNS 검색량을 결합
-#   - 월 계산은 (연*12 + (월-1)) 인덱스로 처리해 연도 경계를 정확히 넘김
-#   - off = 0(축제 당월), 음수=이전, 양수=이후
-# ---------------------------------------------------------------------------
-SQL_BASE = """
-WITH fs AS (
-    SELECT sido, sigungu, festival_name, festival_year,
-           year_month AS festival_ym,
-           (year_month/100)*12 + (year_month%100 - 1) AS m_idx
-    FROM festival
-    WHERE period = 'FESTIVAL' AND festival_year >= 2020
-),
-sx AS (
-    SELECT sido, sigungu, year_month, search_volume,
-           (year_month/100)*12 + (year_month%100 - 1) AS m_idx
-    FROM sns_mention
-)
-SELECT fs.sido, fs.sigungu, fs.festival_name, fs.festival_year, fs.festival_ym,
-       (sx.m_idx - fs.m_idx) AS off,
-       sx.search_volume
-FROM fs
-JOIN sx
-  ON sx.sido = fs.sido
- AND sx.sigungu = fs.sigungu
- AND sx.m_idx BETWEEN fs.m_idx - 3 AND fs.m_idx + 3;
-"""
-
-SQL_SELECTED = """
--- 2020년 이후 개최된 모든 축제(회차)를 분석 대상으로 사용.
--- 별도 선별 없이 festival 테이블에서 FESTIVAL 행을 기준월(M)로 삼는다.
-SELECT *
+SQL_FEST = """
+-- 분석 대상: 2020년 이후 개최된 모든 축제의 개최월(기준월 M)
+SELECT sido, sigungu, festival_name, festival_year, year_month
 FROM festival
 WHERE period = 'FESTIVAL' AND festival_year >= 2020;
 """
+SQL_SNS = """
+-- 시군구 × 월 SNS 검색량 패널 (2020.01 ~ 2025.12)
+SELECT sido, sigungu, year_month, search_volume
+FROM sns_mention;
+"""
 
 
-# ---------------------------------------------------------------------------
-# 데이터 로딩 & 가공 (streamlit 비의존 순수 로직)
-# ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def load_base(db_path: str) -> pd.DataFrame:
+def load(db_path: str):
     con = sqlite3.connect(db_path)
     try:
-        df = pd.read_sql(SQL_BASE, con)
+        fest = pd.read_sql(SQL_FEST, con)
+        sns = pd.read_sql(SQL_SNS, con)
     finally:
         con.close()
-    return df
+    return fest, sns
 
 
-def build_edition(base: pd.DataFrame) -> pd.DataFrame:
-    """회차(edition)별 지표 집계."""
-    def agg(g):
-        sv = g.set_index("off")["search_volume"]
-        vf = sv.get(0, np.nan)
-        before = g.loc[g.off.between(-3, -1), "search_volume"]
-        after = g.loc[g.off.between(1, 3), "search_volume"]
-        around = g.loc[g.off != 0, "search_volume"]
-        return pd.Series({
-            "vol_festival": vf,
-            "avg_before_3m": before.mean(),
-            "avg_after_3m": after.mean(),
-            "baseline_6m": around.mean(),
-            "n_before": before.count(),
-            "n_after": after.count(),
+def midx(year_month):
+    return (year_month // 100) * 12 + (year_month % 100 - 1)
+
+
+def build_panel(sns: pd.DataFrame) -> dict:
+    sns = sns.copy()
+    sns["m_idx"] = midx(sns["year_month"])
+    return {(r.sido, r.sigungu, r.m_idx): r.search_volume for r in sns.itertuples()}
+
+
+def window_metrics(panel, sido, sigungu, m_idx):
+    """기준월 m_idx에 대해 ±3개월 윈도우 지표. 완전 윈도우가 아니면 None."""
+    vf = panel.get((sido, sigungu, m_idx))
+    bef = [panel.get((sido, sigungu, m_idx + o)) for o in (-3, -2, -1)]
+    aft = [panel.get((sido, sigungu, m_idx + o)) for o in (1, 2, 3)]
+    if vf is None or any(x is None for x in bef + aft):
+        return None
+    baseline = float(np.mean(bef + aft))
+    return {
+        "vol_festival": float(vf),
+        "avg_before": float(np.mean(bef)),
+        "avg_after": float(np.mean(aft)),
+        "baseline": baseline,
+        "lift": vf / baseline,
+        "afterglow": float(np.mean(aft)) / float(np.mean(bef)),
+        "profile": {o: panel.get((sido, sigungu, m_idx + o)) for o in range(-3, 4)},
+    }
+
+
+@st.cache_data(show_spinner=False)
+def analyze(db_path: str):
+    fest, sns = load(db_path)
+    panel = build_panel(sns)
+    fest = fest.copy()
+    fest["moy"] = fest["year_month"] % 100
+
+    edition_rows, fest_rows = [], []
+    for (sido, sigungu, name), g in fest.groupby(["sido", "sigungu", "festival_name"]):
+        # --- 처치(treatment): 실제 개최 회차 ---
+        treat = []
+        for _, r in g.iterrows():
+            w = window_metrics(panel, sido, sigungu, midx(r.year_month))
+            if w:
+                w2 = {k: v for k, v in w.items() if k != "profile"}
+                edition_rows.append({"sido": sido, "sigungu": sigungu,
+                                     "festival_name": name,
+                                     "festival_year": int(r.festival_year),
+                                     "festival_ym": int(r.year_month),
+                                     "kind": "처치(개최)", **w2})
+                treat.append(w)
+        if not treat:
+            continue
+
+        # --- 반사실(placebo): 같은 달, 축제 미개최 연도(2020/2021) ---
+        plac = []
+        for moy in sorted(set(g.moy)):
+            for py in PLACEBO_YEARS:
+                w = window_metrics(panel, sido, sigungu, py * 12 + (moy - 1))
+                if w:
+                    w2 = {k: v for k, v in w.items() if k != "profile"}
+                    edition_rows.append({"sido": sido, "sigungu": sigungu,
+                                         "festival_name": name,
+                                         "festival_year": py,
+                                         "festival_ym": py * 100 + moy,
+                                         "kind": "반사실(미개최)", **w2})
+                    plac.append(w)
+
+        def m(lst, key):
+            return float(np.mean([x[key] for x in lst])) if lst else np.nan
+
+        # 처치 평균 프로파일(baseline=100 정규화) — 상세탭용
+        prof = {o: [] for o in range(-3, 4)}
+        for t in treat:
+            bl = t["baseline"]
+            for o, v in t["profile"].items():
+                if v is not None and bl:
+                    prof[o].append(v / bl * 100)
+        prof_mean = {o: (float(np.mean(prof[o])) if prof[o] else np.nan)
+                     for o in range(-3, 4)}
+
+        fest_rows.append({
+            "sido": sido, "sigungu": sigungu, "festival_name": name,
+            "n_editions": int(g.festival_year.nunique()),
+            "n_placebo": len(plac),
+            "lift": m(treat, "lift"),
+            "plac_lift": m(plac, "lift"),
+            "afterglow": m(treat, "afterglow"),
+            "plac_afterglow": m(plac, "afterglow"),
+            "vol_festival": m(treat, "vol_festival"),
+            "baseline": m(treat, "baseline"),
+            "profile": prof_mean,
         })
 
-    e = (base.groupby(["sido", "sigungu", "festival_name", "festival_year", "festival_ym"])
-              .apply(agg).reset_index())
-    e["lift_ratio"] = e.vol_festival / e.baseline_6m
-    e["afterglow_ratio"] = e.avg_after_3m / e.avg_before_3m
-    e["full_window"] = (e.n_before == 3) & (e.n_after == 3)
-    return e
+    F = pd.DataFrame(fest_rows)
+    F["net_lift"] = F.lift - F.plac_lift                 # 계절보정 단기 순효과
+    F["net_afterglow"] = F.afterglow - F.plac_afterglow  # 계절보정 지속 순효과
+    E = pd.DataFrame(edition_rows)
+    return F, E
 
 
-def build_festival(edition_full: pd.DataFrame) -> pd.DataFrame:
-    """축제 단위 집계(회차 평균) — 독립표본 n개."""
-    f = (edition_full.groupby(["sido", "sigungu", "festival_name"])
-         .agg(vol_festival=("vol_festival", "mean"),
-              baseline_6m=("baseline_6m", "mean"),
-              avg_before_3m=("avg_before_3m", "mean"),
-              avg_after_3m=("avg_after_3m", "mean"),
-              n_editions=("festival_year", "nunique"))
-         .reset_index())
-    f["lift_ratio"] = f.vol_festival / f.baseline_6m
-    f["afterglow_ratio"] = f.avg_after_3m / f.avg_before_3m
-    return f
-
-
-def run_tests(fest: pd.DataFrame) -> dict:
-    """축제 단위 paired 검정."""
-    a, b = fest.vol_festival.values, fest.baseline_6m.values
-    out = {"n": len(fest)}
+def paired_test(a, b):
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    mask = ~(np.isnan(a) | np.isnan(b))
+    a, b = a[mask], b[mask]
     try:
         w = stats.wilcoxon(a, b)
-        out["wilcoxon_stat"], out["wilcoxon_p"] = float(w.statistic), float(w.pvalue)
+        return float(w.statistic), float(w.pvalue), len(a)
     except Exception:
-        out["wilcoxon_stat"], out["wilcoxon_p"] = np.nan, np.nan
-    try:  # 비율 데이터라 로그 변환 후 paired t-test
-        t = stats.ttest_rel(np.log(a), np.log(b))
-        out["logt_p"] = float(t.pvalue)
-    except Exception:
-        out["logt_p"] = np.nan
-    out["median_lift"] = float(np.median(fest.lift_ratio))
-    out["pct_positive"] = float((fest.lift_ratio > 1).mean())
-    out["n_positive"] = int((fest.lift_ratio > 1).sum())
-    return out
+        return np.nan, np.nan, len(a)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # UI
-# ---------------------------------------------------------------------------
-st.title("축제가 온라인 관심도에 미치는 영향")
-st.caption("2020년 이후 개최된 모든 축제의 개최 당월 SNS 검색량을 전후 기준선과 비교")
+# ===========================================================================
+st.title("축제가 온라인 관심도에 미치는 실질 영향")
+st.caption("계절성을 보정한 이중차분(DiD): 코로나로 축제가 없던 2020·2021년 같은 달을 대조군으로 사용 "
+           "· ±3개월 윈도우 · 2020년 이후 개최 축제 전체")
 
 with st.sidebar:
     st.header("설정")
     db_path = st.text_input("SQLite DB 경로", value="festival.db")
     st.markdown("필요 테이블: `festival`, `sns_mention`")
+    st.divider()
+    st.markdown("**지표 정의**")
+    st.markdown(
+        "- **Lift**: 축제月 ÷ 전후 6개월 평균\n"
+        "- **반사실 Lift**: 같은 달(미개최 연)의 Lift\n"
+        "- **Net Lift = Lift − 반사실 Lift**\n"
+        "  → 계절수요를 뺀 *순수 축제 효과*\n"
+        "- **Afterglow**: 후3M ÷ 전3M (지속효과)\n"
+        "- **Net Afterglow**: 계절보정 지속효과")
 
 try:
-    base = load_base(db_path)
+    F, E = analyze(db_path)
 except Exception as ex:
-    st.error(f"DB 로딩 실패: {ex}")
+    st.error(f"DB 로딩/분석 실패: {ex}")
     st.stop()
 
-if base.empty:
+if F.empty:
     st.warning("결합 결과가 비어 있습니다. 테이블/지역명 매칭을 확인하세요.")
     st.stop()
 
-edition = build_edition(base)
-edition_full = edition[edition.full_window].copy()      # 완전 ±3 윈도우만 검정에 사용
-fest = build_festival(edition_full)
-res = run_tests(fest)
+V = F.dropna(subset=["net_lift"]).copy()   # 반사실 확보 축제
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["핵심 결과", "축제별 비교", "개별 축제 상세", "방법론 · SQL"])
+ls, lp, ln = paired_test(V.lift, V.plac_lift)             # net lift
+as_, ap, an = paired_test(V.afterglow, V.plac_afterglow)  # net afterglow
+raw_s, raw_p, raw_n = paired_test(F.vol_festival, F.baseline)  # 계절 미보정 raw
 
-# ---------------- TAB 1 : 핵심 결과 ----------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["핵심 결과", "계절보정 효과", "효과 유형 분류", "개별 축제", "방법론 · SQL"])
+
+# ---------------- TAB 1 ----------------
 with tab1:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("분석 축제 수", f"{res['n']}개")
-    c2.metric("검색량 상승 축제", f"{res['n_positive']}/{res['n']}",
-              f"{res['pct_positive']*100:.0f}%")
-    c3.metric("중앙 Lift", f"{res['median_lift']:.2f}배",
-              help="축제 당월 검색량 ÷ 전후 6개월 평균")
-    c4.metric("Wilcoxon p-value", f"{res['wilcoxon_p']:.4f}",
-              "유의" if res['wilcoxon_p'] < 0.05 else "비유의")
+    st.subheader("계절성 보정 전 vs 후")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("분석 축제 수", f"{len(V)}개", help="반사실(2020/2021 같은달) 확보 축제")
+    c2.metric("단기효과 Net Lift (중앙)", f"{V.net_lift.median():+.2f}",
+              f"양(+) 축제 {int((V.net_lift>0).sum())}/{len(V)}")
+    c3.metric("지속효과 Net Afterglow (중앙)", f"{V.net_afterglow.median():+.2f}",
+              f"양(+) 축제 {int((V.net_afterglow>0).sum())}/{len(V)}")
 
-    sig = res["wilcoxon_p"] < 0.05
-    st.markdown(
-        f"""
-**인사이트 요약**
+    c4, c5, c6 = st.columns(3)
+    c4.metric("보정 전 Lift (중앙)", f"{F.lift.median():.2f}배")
+    c5.metric("단기효과 검정 p", f"{lp:.4f}", "유의" if lp < 0.05 else "비유의")
+    c6.metric("지속효과 검정 p", f"{ap:.4f}", "유의" if ap < 0.05 else "비유의")
 
-- 축제 개최 당월의 SNS 검색량은 전후 6개월 평균 대비 **중앙값 {res['median_lift']:.2f}배** 수준으로,
-  분석 대상 {res['n']}개 축제 중 **{res['n_positive']}개({res['pct_positive']*100:.0f}%)**에서 상승이 관찰됨.
-- 축제 단위 paired 비모수 검정(Wilcoxon signed-rank) 결과 **p = {res['wilcoxon_p']:.4f}**
-  → {"통계적으로 유의한 상승 (p<0.05). 즉 축제 개최가 온라인 관심도를 끌어올린다는 근거." if sig else "유의수준 0.05에서 유의하지 않음."}
-- 보조 검정(로그변환 paired t-test) p = {res['logt_p']:.4f} 로 동일한 결론.
-        """)
+    sig_l, sig_a = lp < 0.05, ap < 0.05
+    st.markdown(f"""
+**핵심 인사이트**
 
-    edition_full["방향"] = np.where(edition_full.lift_ratio > 1, "상승(>1)", "하락(≤1)")
-    fig = px.histogram(edition_full, x="lift_ratio", nbins=24, color="방향",
-                       color_discrete_map={"상승(>1)": "#2E86DE", "하락(≤1)": "#C0392B"},
-                       labels={"lift_ratio": "Lift (당월 ÷ 전후6개월)"},
-                       title="회차별 Lift 분포")
-    fig.add_vline(x=1.0, line_dash="dash", line_color="black",
-                  annotation_text="기준선 1.0")
-    fig.add_vline(x=edition_full.lift_ratio.median(), line_color="#2E86DE",
-                  annotation_text=f"중앙값 {edition_full.lift_ratio.median():.2f}")
+1. **계절성을 빼면 효과는 작아진다.** 보정 전 Lift 중앙값은 {F.lift.median():.2f}배지만,
+   계절수요(반사실)를 제거한 **Net Lift 중앙값은 {V.net_lift.median():+.2f}** 수준.
+   즉 기존 분석의 상당 부분은 *축제 효과가 아니라 그 지역·그 계절의 자연 검색 증가*였다.
+
+2. **단기 관심도 상승은 {"유의하다" if sig_l else "유의하지 않다"}** (Wilcoxon 처치 vs 반사실, p={lp:.4f}).
+   {int((V.net_lift>0).sum())}/{len(V)} 축제가 계절 보정 후에도 양(+)의 순효과.
+
+3. **지속적 인지도 상승 근거는 {"있다" if sig_a else "없다"}** (Net Afterglow p={ap:.4f}).
+   {"개최 후에도 검색이 베이스라인보다 높게 유지됨." if sig_a else "개최 후 관심도가 베이스라인 이상으로 유지된다는 증거는 없음 → '반짝 효과'에 가깝다."}
+
+> 결론: 축제는 {"개최 당월의 온라인 관심도를 (작지만 유의하게) 끌어올린다" if sig_l else "개최 당월 관심도에 뚜렷한 순효과를 주지 못한다"}.
+> 다만 {"지속적인 지역 인지도 상승으로 이어진다는 근거는 약하다." if not sig_a else "그 효과가 개최 이후에도 일정 부분 지속된다."}
+""")
+
+    comp = V.sort_values("net_lift", ascending=True)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(y=comp.festival_name, x=comp.lift - 1, name="보정 전 (Lift−1)",
+                         orientation="h", marker_color="#BDC3C7"))
+    fig.add_trace(go.Bar(y=comp.festival_name, x=comp.net_lift, name="Net Lift (계절보정)",
+                         orientation="h", marker_color="#2E86DE"))
+    fig.add_vline(x=0, line_color="black")
+    fig.update_layout(barmode="overlay", height=820, title="보정 전 효과 vs 계절보정 순효과",
+                      xaxis_title="효과 크기 (0 = 무효과)", legend=dict(orientation="h"))
     st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"회차 기준: 완전 ±3개월 윈도우 {len(edition_full)}개 "
-               f"(전체 {len(edition)}개 중). 1.0 초과 = 축제 당월에 검색량 급증.")
+    st.caption("회색이 길고 파랑이 짧거나 음수면, 보였던 효과가 사실은 계절수요였다는 뜻.")
 
-# ---------------- TAB 2 : 축제별 비교 ----------------
+# ---------------- TAB 2 ----------------
 with tab2:
-    fsort = fest.sort_values("lift_ratio", ascending=True)
-    fig = px.bar(fsort, x="lift_ratio", y="festival_name", orientation="h",
-                 color=fsort.lift_ratio > 1,
+    st.subheader("Net Lift — 계절수요를 제거한 순수 축제 효과")
+    s = V.sort_values("net_lift")
+    fig = px.bar(s, x="net_lift", y="festival_name", orientation="h",
+                 color=s.net_lift > 0,
                  color_discrete_map={True: "#2E86DE", False: "#C0392B"},
-                 labels={"lift_ratio": "Lift", "festival_name": ""},
-                 title="축제별 Lift (회차 평균)")
-    fig.add_vline(x=1.0, line_dash="dash", line_color="black")
-    fig.update_layout(showlegend=False, height=720)
+                 labels={"net_lift": "Net Lift (축제 − 반사실)", "festival_name": ""})
+    fig.add_vline(x=0, line_color="black")
+    fig.update_layout(showlegend=False, height=820)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### 효과 유형 4분면 (스파이크 강도 × 지속 효과)")
-    fig2 = px.scatter(fest, x="lift_ratio", y="afterglow_ratio",
-                      text="festival_name", size="vol_festival",
-                      labels={"lift_ratio": "Lift (당월 스파이크)",
-                              "afterglow_ratio": "Afterglow (후3M ÷ 전3M)"})
-    fig2.add_vline(x=1.0, line_dash="dash", line_color="gray")
-    fig2.add_hline(y=1.0, line_dash="dash", line_color="gray")
-    fig2.update_traces(textposition="top center", textfont_size=9)
-    fig2.update_layout(height=560)
+    st.subheader("처치 vs 반사실 직접 비교")
+    fig2 = px.scatter(V, x="plac_lift", y="lift", text="festival_name",
+                      labels={"plac_lift": "반사실 Lift (미개최 연 같은 달)",
+                              "lift": "처치 Lift (개최 연)"})
+    lim = [min(V.plac_lift.min(), V.lift.min()) * 0.95,
+           max(V.plac_lift.max(), V.lift.max()) * 1.05]
+    fig2.add_trace(go.Scatter(x=lim, y=lim, mode="lines",
+                              line=dict(dash="dash", color="gray"), name="y=x"))
+    fig2.update_traces(textposition="top center", textfont_size=8,
+                       selector=dict(mode="markers+text"))
+    fig2.update_layout(height=600, showlegend=False)
     st.plotly_chart(fig2, use_container_width=True)
-    st.caption("우상단=개최月 급증 + 개최 후에도 관심 지속(가장 효과적). "
-               "우하단=반짝 효과. 좌측=개최月 효과 미미.")
+    st.caption("대각선 위쪽 = 축제 연도가 미개최 연도보다 검색이 더 튐(순효과 +). "
+               "아래쪽 = 계절 착시(축제 없어도 그 달에 원래 검색이 높음).")
 
+# ---------------- TAB 3 ----------------
+with tab3:
+    st.subheader("효과 유형 4분면: 단기 순효과 × 지속 순효과")
+    Q = V.copy()
+    fig = px.scatter(Q, x="net_lift", y="net_afterglow", text="festival_name",
+                     size=Q.vol_festival, color="net_lift",
+                     color_continuous_scale="RdBu", color_continuous_midpoint=0,
+                     labels={"net_lift": "Net Lift (단기 순효과)",
+                             "net_afterglow": "Net Afterglow (지속 순효과)"})
+    fig.add_vline(x=0, line_dash="dash", line_color="gray")
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    fig.update_traces(textposition="top center", textfont_size=8)
+    fig.update_layout(height=640)
+    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("""
+- **우상단**: 개최月 관심 급증 + 개최 후에도 베이스라인 상승 → *지역 인지도에 실질 기여* (최우선 후보)
+- **우하단**: 개최月엔 튀지만 곧 원위치 → *반짝 효과*
+- **좌측(음수)**: 계절수요를 빼면 순효과 없음/역효과 → *효과 좋은 축제로 오선정 주의*
+""")
     st.dataframe(
-        fest.sort_values("lift_ratio", ascending=False)[
+        V.sort_values("net_lift", ascending=False)[
             ["festival_name", "sido", "sigungu", "n_editions",
-             "vol_festival", "baseline_6m", "lift_ratio", "afterglow_ratio"]
-        ].round(2),
+             "lift", "plac_lift", "net_lift", "afterglow", "plac_afterglow", "net_afterglow"]
+        ].round(3), use_container_width=True, hide_index=True)
+
+# ---------------- TAB 4 ----------------
+with tab4:
+    pick = st.selectbox("축제 선택", V.sort_values("net_lift", ascending=False).festival_name)
+    row = F[F.festival_name == pick].iloc[0]
+
+    sub = E[E.festival_name == pick]
+    prof = row["profile"]
+    figp = go.Figure()
+    figp.add_trace(go.Scatter(
+        x=[OFFSET_LABEL[o] for o in range(-3, 4)],
+        y=[prof[o] for o in range(-3, 4)],
+        mode="lines+markers", line=dict(width=3, color="#2E86DE"),
+        name="개최 연(처치)"))
+    figp.add_hline(y=100, line_dash="dash", line_color="gray",
+                   annotation_text="기준선 100")
+    figp.update_layout(
+        title=f"{pick} — 개최 전후 검색량 프로파일 (기준선=100, 회차 평균)",
+        yaxis_title="정규화 검색량", height=440,
+        xaxis=dict(categoryorder="array", categoryarray=PERIOD_ORDER))
+    st.plotly_chart(figp, use_container_width=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Net Lift", f"{row.net_lift:+.2f}",
+              help=f"처치 {row.lift:.2f} − 반사실 {row.plac_lift:.2f}")
+    c2.metric("Net Afterglow", f"{row.net_afterglow:+.2f}")
+    c3.metric("개최 회차", f"{int(row.n_editions)}회")
+    c4.metric("반사실 표본", f"{int(row.n_placebo)}개")
+
+    st.markdown("##### 회차/반사실 원자료")
+    st.dataframe(
+        sub[["kind", "festival_year", "festival_ym", "vol_festival",
+             "avg_before", "avg_after", "baseline", "lift", "afterglow"]].round(2),
         use_container_width=True, hide_index=True)
 
-# ---------------- TAB 3 : 개별 축제 상세 ----------------
-with tab3:
-    pick = st.selectbox("축제 선택",
-                        fest.sort_values("lift_ratio", ascending=False).festival_name)
-    sub = base[base.festival_name == pick].copy()
-    # 회차별 baseline으로 정규화(=100) 후 offset 프로파일 평균 → 스파이크 형태 비교
-    prof = []
-    for yr, g in sub.groupby("festival_year"):
-        bl = g.loc[g.off != 0, "search_volume"].mean()
-        if bl and not np.isnan(bl):
-            t = g.copy()
-            t["idx100"] = t.search_volume / bl * 100
-            prof.append(t)
-    prof = pd.concat(prof)
-    pm = prof.groupby("off")["idx100"].mean().reindex(range(-3, 4)).reset_index()
-    pm["period"] = pm.off.map(OFFSET_LABEL)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=pm.period, y=pm.idx100, mode="lines+markers",
-                             line=dict(width=3, color="#2E86DE")))
-    fig.add_hline(y=100, line_dash="dash", line_color="gray",
-                  annotation_text="기준선 100")
-    fig.update_layout(title=f"{pick} — 전후 검색량 프로파일 (기준선=100, 회차평균)",
-                      yaxis_title="정규화 검색량", xaxis_title="",
-                      xaxis=dict(categoryorder="array", categoryarray=PERIOD_ORDER),
-                      height=460)
-    st.plotly_chart(fig, use_container_width=True)
-
-    row = fest[fest.festival_name == pick].iloc[0]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Lift", f"{row.lift_ratio:.2f}배")
-    c2.metric("Afterglow", f"{row.afterglow_ratio:.2f}")
-    c3.metric("분석 회차", f"{int(row.n_editions)}회")
-
-    st.markdown("##### 회차별 원자료")
-    st.dataframe(
-        edition[edition.festival_name == pick][
-            ["festival_year", "festival_ym", "vol_festival",
-             "avg_before_3m", "avg_after_3m", "lift_ratio", "full_window"]
-        ].round(2), use_container_width=True, hide_index=True)
-
-# ---------------- TAB 4 : 방법론 · SQL ----------------
-with tab4:
+# ---------------- TAB 5 ----------------
+with tab5:
     st.markdown(f"""
 ### 분석 목적
-축제 개최가 해당 지역의 **온라인 관심도(SNS 검색량)** 를 끌어올리는지 검증한다.
+축제 개최가 해당 지역의 **온라인 관심도(SNS 검색량)** 를 *계절수요를 넘어서* 끌어올리는지,
+또 그 효과가 **개최 이후에도 지속**되어 실질적 지역 인지도 상승으로 이어지는지 검증한다.
 
-### 데이터 & 전처리
-- `festival`: **2020년 이후 개최된 모든 축제**를 분석 대상으로 사용. 각 개최를
-  `BEFORE_3M ~ FESTIVAL ~ AFTER_3M` 7개 period 행으로 펼친 long 구조.
-- `sns_mention`: 시군구 × 월 단위 검색량(2020.01–2025.12, 42개 시군 × 72개월 = 완전 패널).
-- 결합 키: `sido + sigungu`, 시점은 **(연×12 + 월−1) 인덱스**로 변환해 연도 경계를 정확히 처리.
+### 왜 기존 방식을 보정했나 (문제 정의)
+대부분 매년 같은 시기에 열리는 **계절 축제**라, 단순히 "축제月 vs ±3개월"을 비교하면
+*축제 효과* 와 *그 지역·그 계절의 자연 검색 수요* 가 분리되지 않는다.
+실제로 보정 전 Lift 중앙값({F.lift.median():.2f}배)의 상당 부분이 계절성에서 비롯됨이 확인되었다.
 
-### 지표 정의
-- **Lift = 축제 당월 검색량 ÷ 전후 6개월(±3M, 당월 제외) 평균**
-  · 1.0 초과 = 개최月에 검색량 급증. 지역 규모에 따른 절대량 차이를 제거하기 위해 *비율*로 정의.
-- **Afterglow = 후3개월 평균 ÷ 전3개월 평균** : 개최 이후 관심도 지속(잔존 효과) 여부.
+### 식별 전략 — 코로나 자연실험 (이중차분, DiD)
+분석 대상 축제 전부가 **2020·2021년에는 코로나로 미개최**였고, SNS 패널은 2020.01부터 존재한다.
+따라서 같은 시군구·같은 달(month-of-year)의 2020/2021 값은 **'축제가 없었던 같은 시즌'** 이라는
+깨끗한 반사실(counterfactual)이 된다.
+
+- **처치(treatment)**: 개최 연도의 개최月 기준 ±3개월 윈도우 지표(Lift, Afterglow)
+- **반사실(control)**: 같은 달·미개최 연도(2020/2021)의 동일 지표
+- **순효과**: `Net = 처치 − 반사실` → 두 그룹에 공통인 계절성이 차감됨
+
+### 지표 정의 (±3개월 윈도우 유지)
+- **Lift** = 축제月 검색량 ÷ 전후 6개월(±3M, 당월 제외) 평균 → 단기 관심도 스파이크
+- **Afterglow** = 후3개월 평균 ÷ 전3개월 평균 → 개최 후 관심 지속(지역 인지도 잔존)
+- **Net Lift / Net Afterglow** = 위 지표의 처치 − 반사실
 
 ### 통계 기법 & 분석 단위
-1. **분석 단위 분리** — 같은 축제의 여러 회차는 서로 독립이 아니므로(pseudoreplication),
-   회차 지표를 **축제 단위로 평균**하여 독립표본 n = {res['n']}개로 검정.
-2. **Wilcoxon signed-rank test** (paired, 비모수) — 표본이 작고 검색량 분포의 정규성을 보장할 수
-   없어 모수 검정 대신 사용. H₀: 당월 검색량 = 전후 기준선.
-3. **로그변환 paired t-test** 를 보조로 병행(비율 데이터의 비대칭 완화) → 동일 결론 확인.
-4. **효과크기**: 중앙 Lift, 상승 축제 비율로 실질적 크기를 함께 보고(p값만으로 판단하지 않음).
+1. **분석 단위 분리**: 한 축제의 여러 회차는 독립이 아니므로(pseudoreplication),
+   회차 지표를 **축제 단위로 평균**해 독립표본 n = {len(V)}개로 검정.
+2. **Wilcoxon signed-rank (paired, 비모수)**: 처치 Lift vs 반사실 Lift를 짝지어 검정.
+   소표본·비정규 분포에 강건. H₀: 처치 = 반사실(순효과 0).
+3. **지속효과**도 동일하게 Afterglow에 대해 처치 vs 반사실 paired 검정.
+4. **효과크기 병기**: p값뿐 아니라 Net 중앙값과 순효과 양(+) 축제 비율을 함께 보고.
 
-### 결과
-- Wilcoxon p = **{res['wilcoxon_p']:.4f}**, 로그 t-test p = **{res['logt_p']:.4f}**,
-  중앙 Lift = **{res['median_lift']:.2f}배**, 상승 축제 **{res['n_positive']}/{res['n']}**.
+### 결과 요약
+- 단기효과: Net Lift 중앙 **{V.net_lift.median():+.2f}**, p = **{lp:.4f}** ({"유의" if lp<0.05 else "비유의"}),
+  양(+) {int((V.net_lift>0).sum())}/{len(V)}.
+- 지속효과: Net Afterglow 중앙 **{V.net_afterglow.median():+.2f}**, p = **{ap:.4f}** ({"유의" if ap<0.05 else "비유의"}).
+- (참고) 계절 미보정 raw 검정 p = {raw_p:.4f} → 보정 시 효과가 보수적으로 줄어듦.
 
-### 한계 (해석 시 주의)
-- SNS 검색량은 **시군구 단위**라 한 지역에 축제가 여럿이면(예: 논산·하동) 신호가 섞임.
-- 대부분 계절 축제 → ±3개월 비교가 계절성을 완전히 제거하지 못함(보강: 전년 동월 대비).
-- 검색량은 ‘관심도’의 대리지표일 뿐, 실제 방문·소비와는 별개 차원.
-- 외부 사건(뉴스·바이럴 등) 통제 불가 → 인과가 아닌 **연관(association)** 으로 해석.
-    """)
-
-    st.markdown("#### 1) 선별 축제 테이블")
-    st.code(SQL_SELECTED, language="sql")
-    st.markdown("#### 2) 분석 기반 결합 SQL (당월 ±3개월 검색량)")
-    st.code(SQL_BASE, language="sql")
-    st.caption("이후 회차/축제 단위 집계와 검정은 app.py의 pandas·scipy 로직에서 수행.")
+### 한계
+- 반사실이 **코로나 시기(2020/2021)** 라, 팬데믹 자체의 이동·검색 위축이 대조군에 섞일 수 있음
+  (효과를 다소 과대평가할 가능성). 비개최 연도가 더 있으면 보강 권장.
+- SNS 검색량은 **시군구 단위** → 한 지역 다축제(논산·하동 등)는 신호 혼입.
+- 검색량은 '관심도'의 대리지표이며 실제 방문·소비와는 별개 차원.
+- 본 분석은 인과적 식별을 *근사* 하지만, 외부 사건(뉴스·바이럴) 완전 통제는 불가 → 강한 연관으로 해석.
+""")
+    st.markdown("#### 분석 대상 추출 SQL")
+    st.code(SQL_FEST, language="sql")
+    st.markdown("#### SNS 패널 SQL")
+    st.code(SQL_SNS, language="sql")
+    st.caption("±3개월 윈도우 구성, 처치/반사실 결합·집계·검정은 app.py의 pandas·scipy 로직에서 수행.")
