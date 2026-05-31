@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 축제가 온라인 관심도(SNS 검색량)에 미치는 영향 분석 대시보드
-- 데이터: SQLite (festival_selected, sns_mention)
-- 분석단위: 축제 회차(edition) / 유의성 검정은 축제 단위(n=28)
+- 데이터: SQLite (festival, sns_mention)
+- 분석단위: 축제 회차(edition) / 유의성 검정은 축제 단위(n=44)
 실행: streamlit run app.py
 """
 import sqlite3
@@ -30,7 +30,7 @@ WITH fs AS (
     SELECT sido, sigungu, festival_name, festival_year,
            year_month AS festival_ym,
            (year_month/100)*12 + (year_month%100 - 1) AS m_idx
-    FROM festival_selected
+    FROM festival
     WHERE period = 'FESTIVAL' AND festival_year >= 2020
 ),
 sx AS (
@@ -49,17 +49,11 @@ JOIN sx
 """
 
 SQL_SELECTED = """
--- 2020년 이후 3회 이상 개최한 축제만 선별
-CREATE TABLE festival_selected AS
-SELECT f.*
-FROM festival f
-JOIN (
-    SELECT sido, sigungu, festival_name
-    FROM festival
-    WHERE festival_year >= 2020
-    GROUP BY sido, sigungu, festival_name
-    HAVING COUNT(DISTINCT festival_year) >= 3
-) q USING (sido, sigungu, festival_name);
+-- 2020년 이후 개최된 모든 축제(회차)를 분석 대상으로 사용.
+-- 별도 선별 없이 festival 테이블에서 FESTIVAL 행을 기준월(M)로 삼는다.
+SELECT *
+FROM festival
+WHERE period = 'FESTIVAL' AND festival_year >= 2020;
 """
 
 
@@ -139,12 +133,12 @@ def run_tests(fest: pd.DataFrame) -> dict:
 # UI
 # ---------------------------------------------------------------------------
 st.title("축제가 온라인 관심도에 미치는 영향")
-st.caption("선별 축제(2020년 이후 3회+) 개최 당월의 SNS 검색량을 전후 기준선과 비교")
+st.caption("2020년 이후 개최된 모든 축제의 개최 당월 SNS 검색량을 전후 기준선과 비교")
 
 with st.sidebar:
     st.header("설정")
     db_path = st.text_input("SQLite DB 경로", value="festival.db")
-    st.markdown("필요 테이블: `festival_selected`, `sns_mention`")
+    st.markdown("필요 테이블: `festival`, `sns_mention`")
 
 try:
     base = load_base(db_path)
@@ -280,7 +274,7 @@ with tab4:
 축제 개최가 해당 지역의 **온라인 관심도(SNS 검색량)** 를 끌어올리는지 검증한다.
 
 ### 데이터 & 전처리
-- `festival_selected`: 2020년 이후 **3회 이상** 개최한 축제만 선별(표본 신뢰도 확보). 각 개최를
+- `festival`: **2020년 이후 개최된 모든 축제**를 분석 대상으로 사용. 각 개최를
   `BEFORE_3M ~ FESTIVAL ~ AFTER_3M` 7개 period 행으로 펼친 long 구조.
 - `sns_mention`: 시군구 × 월 단위 검색량(2020.01–2025.12, 42개 시군 × 72개월 = 완전 패널).
 - 결합 키: `sido + sigungu`, 시점은 **(연×12 + 월−1) 인덱스**로 변환해 연도 경계를 정확히 처리.
